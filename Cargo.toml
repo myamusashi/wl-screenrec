@@ -43,10 +43,6 @@ mio = { version = "1.0.4", features = ["os-poll"] }
 signal-hook = "0.4.3"
 signal-hook-mio = { version = "0.3.0", features = ["support-v1_0"] }
 
-[patch.crates-io]
-# Waiting on https://github.com/zmwangx/rust-ffmpeg-sys/pull/91
-ffmpeg-sys-next = { git = "https://github.com/myamusashi/rust-ffmpeg-sys", rev = "20c809ae51f1d04e6bccdd4197d7d9d234dd40f7" }
-
 # Uncomment for local dev
 # ffmpeg-next = { path = "../rust-ffmpeg" }
 # ffmpeg-sys-next = { path = "../rust-ffmpeg-sys" }
@@ -60,7 +56,6 @@ serde_json = "1.0.103"
 
 [features]
 experimental-vulkan = [
-    "ffmpeg-sys-next/vulkan",
     "ash"
 ]
 

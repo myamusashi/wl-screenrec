@@ -18,9 +18,6 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFileContents = builtins.readFile ../Cargo.lock;
-    outputHashes = {
-      "ffmpeg-sys-next-9.0.0" = "sha256-sDSJ2l+1Nh2t87zR5PNGmw4Pa+4n2Jnd6o48wC7jLyM=";
-    };
   };
 
   nativeBuildInputs = [
