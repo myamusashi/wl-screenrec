@@ -148,7 +148,7 @@ fn file_metadata(filename: &Path) -> Value {
                 .arg("-show_streams")
                 .arg("-print_format")
                 .arg("json")
-                .arg(&filename)
+                .arg(filename)
                 .output()
                 .unwrap()
                 .stdout,

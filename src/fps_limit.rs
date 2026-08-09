@@ -1,6 +1,94 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::debug;
+
+use ffmpeg_next::Rational;
+
+const CADENCE_SAMPLE_COUNT: usize = 30;
+
+#[derive(Default)]
+pub struct FrameCadenceSampler {
+    timestamps: Vec<i64>,
+    wall_timestamps: Vec<i64>,
+    wall_origin: Option<Instant>,
+}
+
+impl FrameCadenceSampler {
+    pub fn new() -> Self {
+        Self {
+            timestamps: Vec::with_capacity(CADENCE_SAMPLE_COUNT),
+            wall_timestamps: Vec::with_capacity(CADENCE_SAMPLE_COUNT),
+            wall_origin: None,
+        }
+    }
+
+    pub fn add_timestamp(&mut self, timestamp_ns: i64) {
+        if self.timestamps.len() < CADENCE_SAMPLE_COUNT {
+            self.timestamps.push(timestamp_ns);
+        }
+    }
+
+    pub fn add_wallclock(&mut self, timestamp: Instant) {
+        let origin = *self.wall_origin.get_or_insert(timestamp);
+        let timestamp_ns = timestamp
+            .saturating_duration_since(origin)
+            .as_nanos()
+            .try_into()
+            .unwrap_or(i64::MAX);
+        if self.wall_timestamps.len() < CADENCE_SAMPLE_COUNT {
+            self.wall_timestamps.push(timestamp_ns);
+        }
+    }
+
+    pub fn framerate(&self) -> Option<Rational> {
+        if self.timestamps.len() < 2 {
+            return None;
+        }
+
+        average_framerate(&self.timestamps).or_else(|| average_framerate(&self.wall_timestamps))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.timestamps.len() == CADENCE_SAMPLE_COUNT
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    pub fn used_wallclock(&self) -> bool {
+        average_framerate(&self.timestamps).is_none()
+            && average_framerate(&self.wall_timestamps).is_some()
+    }
+}
+
+fn average_framerate(timestamps: &[i64]) -> Option<Rational> {
+    if timestamps.len() < 2 {
+        return None;
+    }
+    let intervals: Vec<_> = timestamps
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect();
+    if intervals.iter().any(|interval| *interval <= 0) {
+        return None;
+    }
+
+    let total_ns: i64 = intervals.iter().sum();
+    let numerator = 1_000_000_000_i64 * intervals.len() as i64;
+    let divisor = gcd(numerator, total_ns);
+    Some(Rational::new(
+        (numerator / divisor).try_into().ok()?,
+        (total_ns / divisor).try_into().ok()?,
+    ))
+}
+
+fn gcd(mut left: i64, mut right: i64) -> i64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left.abs()
+}
 
 pub struct FpsLimit<T> {
     min_dt: Duration,
@@ -103,7 +191,7 @@ mod test {
         }
 
         let ct = acc.len();
-        assert!(ct >= 28 && ct < 32, "ct={ct} acc={acc:?}");
+        assert!((28..32).contains(&ct), "ct={ct} acc={acc:?}");
     }
 
     #[test]
@@ -125,5 +213,57 @@ mod test {
         .collect();
 
         assert_eq!(out_frames, [0, 1, 2, 5])
+    }
+}
+
+#[cfg(test)]
+mod cadence_test {
+    use std::time::{Duration, Instant};
+
+    use super::FrameCadenceSampler;
+
+    #[test]
+    fn measures_synthetic_60hz_cadence() {
+        let mut sampler = FrameCadenceSampler::new();
+        for frame in 0..30 {
+            sampler.add_timestamp(frame * 16_666_667);
+        }
+
+        let fps = sampler.framerate().unwrap();
+        let measured = f64::from(fps.0) / f64::from(fps.1);
+        assert!((59.9..60.1).contains(&measured), "fps={measured}");
+        assert!(sampler.is_ready());
+    }
+
+    #[test]
+    fn too_few_samples_have_no_measurement() {
+        let mut sampler = FrameCadenceSampler::new();
+        sampler.add_timestamp(0);
+        assert_eq!(sampler.framerate(), None);
+        assert_eq!(sampler.sample_count(), 1);
+    }
+
+    #[test]
+    fn degenerate_intervals_have_no_measurement() {
+        let mut sampler = FrameCadenceSampler::new();
+        for _ in 0..30 {
+            sampler.add_timestamp(0);
+        }
+        assert_eq!(sampler.framerate(), None);
+    }
+
+    #[test]
+    fn uses_wallclock_when_presentation_timestamps_are_degenerate() {
+        let mut sampler = FrameCadenceSampler::new();
+        let start = Instant::now();
+        for frame in 0..30 {
+            sampler.add_timestamp(0);
+            sampler.add_wallclock(start + Duration::from_millis(frame * 16));
+        }
+
+        let fps = sampler.framerate().unwrap();
+        let measured = f64::from(fps.0) / f64::from(fps.1);
+        assert!((62.0..63.0).contains(&measured), "fps={measured}");
+        assert!(sampler.used_wallclock());
     }
 }

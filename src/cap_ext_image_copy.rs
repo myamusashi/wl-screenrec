@@ -5,22 +5,24 @@ use drm::{buffer::DrmFourcc, node::DrmNode};
 use libc::dev_t;
 use log::{debug, warn};
 use log_once::warn_once;
-use wayland_client::{
-    Dispatch, Proxy, QueueHandle, globals::GlobalList, protocol::wl_output::WlOutput,
-};
+use wayland_client::{Dispatch, Proxy, QueueHandle, globals::GlobalList};
 use wayland_protocols::ext::{
     image_capture_source::v1::client::{
+        ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
         ext_image_capture_source_v1::ExtImageCaptureSourceV1,
         ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
     },
     image_copy_capture::v1::client::{
-        ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
+        ext_image_copy_capture_frame_v1::{ExtImageCopyCaptureFrameV1, FailureReason},
         ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
         ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
     },
 };
 
-use crate::{CaptureSource, DmabufPotentialFormat, DrmModifier, State};
+use crate::{
+    CaptureSource, CopyFailReason, DmabufPotentialFormat, DrmModifier, EncConstructionStage, State,
+    WhatToCapture,
+};
 
 impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for State<CapExtImageCopy> {
     fn event(
@@ -45,6 +47,18 @@ impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for State<CapExtImageCop
     ) {
     }
 }
+impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for State<CapExtImageCopy> {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        _event: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &wayland_client::Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<ExtImageCaptureSourceV1, ()> for State<CapExtImageCopy> {
     fn event(
         _state: &mut Self,
@@ -118,7 +132,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State<CapExtImageCopy> {
                 );
             }
             ext_image_copy_capture_session_v1::Event::Stopped => {
-                state.on_copy_fail(qhandle); // untested if this actually works
+                state.on_copy_fail(CopyFailReason::Stopped, qhandle); // untested if this actually works
             }
             _ => {}
         }
@@ -142,16 +156,41 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State<CapExtImageCopy> {
                 tv_sec_hi,
                 tv_sec_lo,
                 tv_nsec,
-            } => state.enc.unwrap().cap.time = Some((tv_sec_hi, tv_sec_lo, tv_nsec)),
+            } => state.set_capture_time((tv_sec_hi, tv_sec_lo, tv_nsec)),
             Event::Ready => {
-                let (hi, lo, n) = state.enc.unwrap().cap.time.take().unwrap();
-                state.on_copy_complete(qhandle, hi, lo, n);
+                if let Some((hi, lo, n)) = state.take_capture_time() {
+                    state.on_copy_complete(qhandle, hi, lo, n);
+                } else {
+                    warn!("capture frame became ready without a presentation timestamp");
+                    state.on_copy_fail(CopyFailReason::Unknown, qhandle);
+                }
             }
             Event::Failed { reason } => {
                 debug!("frame copy failed: {reason:?}");
-                state.on_copy_fail(qhandle);
+                state.on_copy_fail(map_failure_reason(reason), qhandle);
             }
-            _ => todo!(),
+            _ => {
+                debug!("unexpected ExtImageCopyCaptureFrameV1 event received");
+                state.on_copy_fail(CopyFailReason::Unknown, qhandle);
+            }
+        }
+    }
+}
+
+impl State<CapExtImageCopy> {
+    fn set_capture_time(&mut self, time: (u32, u32, u32)) {
+        match &mut self.enc {
+            EncConstructionStage::Sampling(sampling) => sampling.cap.time = Some(time),
+            EncConstructionStage::Complete(complete) => complete.cap.time = Some(time),
+            _ => debug!("ignoring presentation timestamp before capture is ready"),
+        }
+    }
+
+    fn take_capture_time(&mut self) -> Option<(u32, u32, u32)> {
+        match &mut self.enc {
+            EncConstructionStage::Sampling(sampling) => sampling.cap.time.take(),
+            EncConstructionStage::Complete(complete) => complete.cap.time.take(),
+            _ => None,
         }
     }
 }
@@ -176,19 +215,34 @@ impl CaptureSource for CapExtImageCopy {
     fn new(
         gm: &GlobalList,
         eq: &QueueHandle<crate::State<Self>>,
-        output: WlOutput,
+        output: WhatToCapture,
     ) -> anyhow::Result<Self> {
-        let capture_man: ExtOutputImageCaptureSourceManagerV1 = gm
-            .bind(
-                eq,
-                1..=ExtOutputImageCaptureSourceManagerV1::interface().version,
-                (),
+        let capture_src = match output {
+            WhatToCapture::Output(wl_output) => {
+                let capture_man: ExtOutputImageCaptureSourceManagerV1 = gm
+                    .bind(
+                        eq,
+                        1..=ExtOutputImageCaptureSourceManagerV1::interface().version,
+                        (),
             )
             .context(
-                "Your compositor does not support expt-output-image-capture-source-manager-v1",
+                "Your compositor does not support ext-output-image-capture-source-manager-v1",
             )?;
-
-        let capture_src = capture_man.create_source(&output, eq, ());
+                capture_man.create_source(&wl_output, eq, ())
+            }
+            WhatToCapture::Toplevel(ext_foreign_toplevel_handle_v1) => {
+                let capture_man: ExtForeignToplevelImageCaptureSourceManagerV1 = gm
+                    .bind(
+                        eq,
+                        1..=ExtForeignToplevelImageCaptureSourceManagerV1::interface().version,
+                        (),
+            )
+            .context(
+                "Your compositor does not support ext-foreign-toplevel-image-capture-source-manager-v1",
+            )?;
+                capture_man.create_source(&ext_foreign_toplevel_handle_v1, eq, ())
+            }
+        };
 
         let copy_man: ExtImageCopyCaptureManagerV1 = gm
             .bind(
@@ -232,5 +286,58 @@ impl CaptureSource for CapExtImageCopy {
     fn on_done_with_frame(&self, f: Self::Frame) {
         debug!("ext_image_copy_capture_frame_v1::destroy");
         f.destroy();
+    }
+}
+
+fn map_failure_reason(reason: wayland_client::WEnum<FailureReason>) -> CopyFailReason {
+    match reason {
+        wayland_client::WEnum::Value(FailureReason::Stopped) => CopyFailReason::Stopped,
+        wayland_client::WEnum::Value(FailureReason::BufferConstraints) => {
+            CopyFailReason::BufferConstraints
+        }
+        wayland_client::WEnum::Value(FailureReason::Unknown) => CopyFailReason::Unknown,
+        wayland_client::WEnum::Unknown(v) => {
+            warn!("unrecognized FailureReason value from compositor: {v}");
+            CopyFailReason::Unknown
+        }
+        _ => CopyFailReason::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayland_client::WEnum;
+
+    #[test]
+    fn test_map_failure_reason_stopped() {
+        assert_eq!(
+            map_failure_reason(WEnum::Value(FailureReason::Stopped)),
+            CopyFailReason::Stopped
+        );
+    }
+
+    #[test]
+    fn test_map_failure_reason_buffer_constraints() {
+        assert_eq!(
+            map_failure_reason(WEnum::Value(FailureReason::BufferConstraints)),
+            CopyFailReason::BufferConstraints
+        );
+    }
+
+    #[test]
+    fn test_map_failure_reason_unknown() {
+        assert_eq!(
+            map_failure_reason(WEnum::Value(FailureReason::Unknown)),
+            CopyFailReason::Unknown
+        );
+    }
+
+    #[test]
+    fn test_map_failure_reason_unknown_value() {
+        assert_eq!(
+            map_failure_reason(WEnum::Unknown(42)),
+            CopyFailReason::Unknown
+        );
     }
 }
